@@ -14,8 +14,6 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      # Node 22 bundles npm 10, which fails `npm ci` on bundled optional deps (@emnapi); use npm 11 to match the lockfile generator.
-      - run: npm install -g npm@11
       - run: npm ci
       - run: npm run build
       - uses: FirebaseExtended/action-hosting-deploy@v0
