@@ -78,5 +78,28 @@ To run this application, you need to use a browser that supports Chrome's experi
 
 - **Framework**: React 18 + Vite + TypeScript (100% strict type safety)
 - **Styling**: Tailwind CSS (Premium glassmorphism, responsive grid layout)
-- **Local AI Engines**: Chrome Built-in AI (Prompt API, Summarizer API)
+- **Local AI Engines**: Chrome Built-in AI (Prompt API, Summarizer API, Translator API, LanguageDetector API)
 
+---
+
+## 📂 Project Structure ✨
+
+The project features a highly modular, clean components architecture partitioned by core UI layout areas:
+
+```text
+src/
+├── assets/          # Static assets (images, icons)
+├── components/      # Modular React Components (Refactored ✨)
+│   ├── AILoadingScreen.tsx   # Phase 1: Security initialization loader
+│   ├── AISetupScreen.tsx     # Phase 2: Chrome built-in models installer
+│   ├── Header.tsx            # App-wide full local security status header
+│   ├── BrainDumpSection.tsx  # Left: Input dump & Virtual Persona critique widgets
+│   ├── WorkspaceSection.tsx  # Middle: 6-component structural matrix layouts
+│   ├── PitchCard.tsx         # Atomic editing card element inside workspace
+│   └── OutputSection.tsx     # Right: Elevator summaries, translator & JSON exporter
+├── utils/
+│   └── chromeAI.ts  # Type-safe singleton wrapper for Chrome Experimental AI APIs
+├── types.ts         # Centralized application types
+├── App.tsx          # Clean main page state coordinator & AI flow controller
+└── main.tsx         # App entry point
+```
