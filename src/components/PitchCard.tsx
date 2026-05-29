@@ -10,7 +10,6 @@ interface PitchCardProps {
 }
 
 export default function PitchCard({
-  field,
   label,
   icon,
   value,
