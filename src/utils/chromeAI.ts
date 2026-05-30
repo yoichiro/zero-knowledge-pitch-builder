@@ -32,6 +32,23 @@ export interface AICapabilities {
   available: AIStatus;
 }
 
+// Chrome 148+ Built-in AI download progress monitor type.
+// The `loaded` value is in range 0..1 in current spec, but older builds
+// emitted absolute byte counts with a `total` field, so handle both.
+export interface DownloadProgressEvent {
+  loaded: number;
+  total?: number;
+}
+
+export interface CreateMonitor {
+  addEventListener(
+    type: 'downloadprogress',
+    listener: (event: DownloadProgressEvent) => void
+  ): void;
+}
+
+export type MonitorCallback = (monitor: CreateMonitor) => void;
+
 export interface LanguageModelSession {
   prompt(input: string): Promise<string>;
   promptStreaming(input: string): AsyncIterable<string>;
@@ -40,7 +57,7 @@ export interface LanguageModelSession {
 }
 
 export interface LanguageModelAPI {
-  create(options?: { systemPrompt?: string }): Promise<LanguageModelSession>;
+  create(options?: { systemPrompt?: string; monitor?: MonitorCallback }): Promise<LanguageModelSession>;
   capabilities(): Promise<AICapabilities>;
   availability(): Promise<string>;
 }
@@ -51,7 +68,7 @@ export interface LanguageDetector {
 }
 
 export interface LanguageDetectorAPI {
-  create(): Promise<LanguageDetector>;
+  create(options?: { monitor?: MonitorCallback }): Promise<LanguageDetector>;
   capabilities(): Promise<AICapabilities>;
   availability(): Promise<string>;
 }
@@ -62,7 +79,7 @@ export interface Summarizer {
 }
 
 export interface SummarizerAPI {
-  create(options?: { type?: string; format?: string; length?: string }): Promise<Summarizer>;
+  create(options?: { type?: string; format?: string; length?: string; monitor?: MonitorCallback }): Promise<Summarizer>;
   capabilities(): Promise<AICapabilities>;
   availability(): Promise<string>;
 }
@@ -73,7 +90,7 @@ export interface Translator {
 }
 
 export interface TranslatorAPI {
-  create(options: { sourceLanguage: string; targetLanguage: string }): Promise<Translator>;
+  create(options: { sourceLanguage: string; targetLanguage: string; monitor?: MonitorCallback }): Promise<Translator>;
   availability(options: { sourceLanguage: string; targetLanguage: string }): Promise<string>;
 }
 
@@ -109,9 +126,6 @@ let cachedSummarizerLong: Summarizer | null = null;
 
 let cachedEnJaTranslator: Translator | null = null;
 let cachedJaEnTranslator: Translator | null = null;
-
-// 疑似ディレイをかけるヘルパー
-const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 /**
  * 可用性ステータスの表記ゆれを正規化します。
@@ -223,32 +237,153 @@ export async function checkAIAvailability(): Promise<AIAvailability> {
 }
 
 /**
- * AIモデルのダウンロード/準備をエミュレートまたは本物のダウンロードを開始します。
+ * Drives real on-device model downloads by invoking each API's create() with
+ * a monitor callback, then surfaces the downloadprogress events through
+ * onProgress. Models already 'available' snap to 100% immediately. Models
+ * whose API is missing are skipped silently. Created instances are cached so
+ * later code paths reuse the same warmed-up sessions.
  */
 export async function prepareAIModels(
-  _availability: AIAvailability,
+  availability: AIAvailability,
   onProgress: (model: string, progress: number) => void
 ): Promise<void> {
-  const models = ['LanguageDetector', 'LanguageModel', 'Summarizer', 'Translator'];
+  // Build a monitor that normalises both 0..1 ratios (Chrome 148+ spec)
+  // and absolute loaded/total byte counts (earlier builds) into 0..100.
+  const buildMonitor = (modelKey: string): MonitorCallback => (m) => {
+    m.addEventListener('downloadprogress', (event) => {
+      const ratio = event.total && event.total > 0
+        ? event.loaded / event.total
+        : event.loaded;
+      const clamped = Math.max(0, Math.min(1, ratio));
+      onProgress(modelKey, Math.round(clamped * 100));
+    });
+  };
 
-  for (const model of models) {
-    let currentProgress = 0;
-    
-    // ダウンロード擬似進行表示
-    while (currentProgress < 100) {
-      const step = Math.floor(Math.random() * 15) + 10;
-      currentProgress = Math.min(100, currentProgress + step);
-      onProgress(model, currentProgress);
-      await delay(Math.floor(Math.random() * 200) + 150);
-    }
-    await delay(300);
+  const tasks: Array<Promise<void>> = [];
+
+  // LanguageDetector
+  if (availability.languageDetector === 'available') {
+    onProgress('LanguageDetector', 100);
+  } else if (availability.languageDetector === 'after-download' && window.LanguageDetector) {
+    onProgress('LanguageDetector', 0);
+    tasks.push((async () => {
+      try {
+        cachedDetector = await window.LanguageDetector!.create({
+          monitor: buildMonitor('LanguageDetector'),
+        });
+        onProgress('LanguageDetector', 100);
+      } catch (e) {
+        console.error('🛡️ [ChromeAI Debug] LanguageDetector download failed:', e);
+        cachedDetector = null;
+        throw e;
+      }
+    })());
+  } else {
+    onProgress('LanguageDetector', 100);
   }
+
+  // LanguageModel — warm a probe session so model weights download once,
+  // then destroy it so feature-specific sessions get fresh state later.
+  if (availability.languageModel === 'available') {
+    onProgress('LanguageModel', 100);
+  } else if (availability.languageModel === 'after-download' && window.LanguageModel) {
+    onProgress('LanguageModel', 0);
+    tasks.push((async () => {
+      try {
+        const probe = await window.LanguageModel!.create({
+          monitor: buildMonitor('LanguageModel'),
+        });
+        probe.destroy();
+        onProgress('LanguageModel', 100);
+      } catch (e) {
+        console.error('🛡️ [ChromeAI Debug] LanguageModel download failed:', e);
+        throw e;
+      }
+    })());
+  } else {
+    onProgress('LanguageModel', 100);
+  }
+
+  // Summarizer — cache the medium-length variant as a sane default reuse.
+  if (availability.summarizer === 'available') {
+    onProgress('Summarizer', 100);
+  } else if (availability.summarizer === 'after-download' && window.Summarizer) {
+    onProgress('Summarizer', 0);
+    tasks.push((async () => {
+      try {
+        cachedSummarizerMedium = await window.Summarizer!.create({
+          type: 'teaser',
+          format: 'plain-text',
+          length: 'medium',
+          monitor: buildMonitor('Summarizer'),
+        });
+        onProgress('Summarizer', 100);
+      } catch (e) {
+        console.error('🛡️ [ChromeAI Debug] Summarizer download failed:', e);
+        cachedSummarizerMedium = null;
+        throw e;
+      }
+    })());
+  } else {
+    onProgress('Summarizer', 100);
+  }
+
+  // Translator — download both en->ja and ja->en pairs since the UI offers
+  // both directions. Aggregate their per-direction progress as an average.
+  if (availability.translator === 'available') {
+    onProgress('Translator', 100);
+  } else if (availability.translator === 'after-download' && window.Translator) {
+    onProgress('Translator', 0);
+    const directionProgress: Record<string, number> = { enJa: 0, jaEn: 0 };
+    const emitAverage = () => {
+      const avg = Math.round((directionProgress.enJa + directionProgress.jaEn) / 2);
+      onProgress('Translator', avg);
+    };
+    const buildDirectionMonitor = (key: 'enJa' | 'jaEn'): MonitorCallback => (m) => {
+      m.addEventListener('downloadprogress', (event) => {
+        const ratio = event.total && event.total > 0
+          ? event.loaded / event.total
+          : event.loaded;
+        directionProgress[key] = Math.round(Math.max(0, Math.min(1, ratio)) * 100);
+        emitAverage();
+      });
+    };
+    tasks.push((async () => {
+      try {
+        cachedEnJaTranslator = await window.Translator!.create({
+          sourceLanguage: 'en',
+          targetLanguage: 'ja',
+          monitor: buildDirectionMonitor('enJa'),
+        });
+        directionProgress.enJa = 100;
+        emitAverage();
+        cachedJaEnTranslator = await window.Translator!.create({
+          sourceLanguage: 'ja',
+          targetLanguage: 'en',
+          monitor: buildDirectionMonitor('jaEn'),
+        });
+        directionProgress.jaEn = 100;
+        onProgress('Translator', 100);
+      } catch (e) {
+        console.error('🛡️ [ChromeAI Debug] Translator download failed:', e);
+        cachedEnJaTranslator = null;
+        cachedJaEnTranslator = null;
+        throw e;
+      }
+    })());
+  } else {
+    onProgress('Translator', 100);
+  }
+
+  await Promise.all(tasks);
 }
 
 /**
  * ハイブリッドに LanguageModel セッションを作成します。
  */
-async function createLanguageModelSession(options?: { systemPrompt?: string }): Promise<LanguageModelSession> {
+async function createLanguageModelSession(
+  options?: { systemPrompt?: string; monitor?: MonitorCallback }
+): Promise<LanguageModelSession> {
   if (window.LanguageModel && typeof window.LanguageModel.create === 'function') {
     console.log('🛡️ [ChromeAI Debug] Creating LanguageModel session via window.LanguageModel.create()');
     return await window.LanguageModel.create(options);
